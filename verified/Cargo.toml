@@ -1,0 +1,17 @@
+[package]
+name = "payment-verified"
+description = "決済サービスのうち、Verus で証明する純粋な部分（利用枠の判定）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vstd.workspace = true
+
+[package.metadata.verus]
+verify = true
+
+[lints]
+workspace = true
