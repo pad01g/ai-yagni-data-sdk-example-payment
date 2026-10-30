@@ -5,6 +5,8 @@
 //!   - 同じ冪等キーには、同じ結果を返す（中身の違う依頼なら 409）。
 //!   - 依頼の形が正しくなければ 400（拒否とは別。記録もしない）。
 //! - `GET /charges/{id}` 決済を返す。
+//! - `GET /charges?idempotency_key=...` その冪等キーの決済を返す（なければ 404）。決済の結果が分からないまま
+//!   残った注文を、呼ぶ側が後から突き合わせるために使う。
 //! - `GET /health`
 //!
 //! カードのトークン:
@@ -15,16 +17,18 @@
 //!
 //! 本物の決済サービスと同じく、冪等キーと決済は再起動をまたいで覚えている。決済は 1 件ずつ
 //! 追記だけのファイル（[`Journal`]、1 行に 1 件の JSON）に書き、起動したときに読み直す。
+//! 書いている途中で落ちて最後の行が切れていたら、その行は捨てる（その決済は呼ぶ側に返していない）。
+//! 書けなかったときはファイルを書く前の長さに戻し、戻せなければそれ以上の決済を断る。
 //! 決済 ID は乱数で作る（再起動しても前の ID と重ならない）。
 //!
 //! compose の中では backend-proxy と同じネットワークにだけ置き、backend-rust からは届かない。
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::path::Path as FsPath;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -33,7 +37,8 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 pub const LIMITED_CARD_LIMIT: u64 = 10_000;
-/// 覚えておく決済の数の上限（模擬のサービスがメモリを使い切らないように）。
+/// 承認する決済の数の上限（模擬のサービスがメモリを使い切らないように）。拒否は数えない
+/// （拒否を繰り返すだけで、ほかの人の決済が永久に断られないように）。
 pub const MAX_CHARGES: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -65,7 +70,11 @@ pub struct Charge {
 pub type Rejection = (StatusCode, &'static str);
 
 /// 決済の記録。1 行に `{"request": .., "charge": ..}` を 1 つ書く。
-pub struct Journal(File);
+pub struct Journal {
+    file: File,
+    /// 書けなかった分を消せなかった（ファイルの終わりが壊れているかもしれない）。以後は書かない。
+    poisoned: bool,
+}
 
 #[derive(Serialize, Deserialize)]
 struct Entry {
@@ -74,26 +83,49 @@ struct Entry {
 }
 
 impl Journal {
-    /// ファイルを開き、そこまでの記録を返す（なければ作る）。
+    /// ファイルを開き、そこまでの記録を返す（なければ作る）。最後の行が改行で終わっていなければ、
+    /// 書いている途中で落ちた行なので捨てる。
     pub fn open(path: &FsPath) -> std::io::Result<(Self, Vec<(ChargeRequest, Charge)>)> {
-        let file = OpenOptions::new().create(true).read(true).append(true).open(path)?;
+        let created = !path.exists();
+        let mut file = OpenOptions::new().create(true).read(true).append(true).open(path)?;
+        if created && let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            // ファイルを作ったことも、ディレクトリに書き込んでおく
+            File::open(dir)?.sync_all()?;
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        if complete < bytes.len() {
+            eprintln!("payment: dropping a torn last line of the journal ({} bytes)", bytes.len() - complete);
+            file.set_len(complete as u64)?;
+            file.sync_data()?;
+        }
         let mut entries = Vec::new();
-        for line in BufReader::new(&file).lines() {
-            let line = line?;
-            if line.trim().is_empty() {
+        for line in bytes[..complete].split(|&b| b == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let e: Entry = serde_json::from_str(&line).map_err(std::io::Error::other)?;
+            let e: Entry = serde_json::from_slice(line).map_err(std::io::Error::other)?;
             entries.push((e.request, e.charge));
         }
-        Ok((Self(file), entries))
+        Ok((Self { file, poisoned: false }, entries))
     }
 
     fn append(&mut self, request: &ChargeRequest, charge: &Charge) -> std::io::Result<()> {
+        if self.poisoned {
+            return Err(std::io::Error::other("the journal could not be repaired after a failed write"));
+        }
         let mut line = serde_json::to_vec(&Entry { request: request.clone(), charge: charge.clone() })?;
         line.push(b'\n');
-        self.0.write_all(&line)?;
-        self.0.sync_data()
+        let before = self.file.metadata()?.len();
+        let written = self.file.write_all(&line).and_then(|()| self.file.sync_data());
+        if written.is_err() {
+            // 書きかけの行を残さない（残すと、次の行がつながって記録が壊れる）
+            if self.file.set_len(before).and_then(|()| self.file.sync_data()).is_err() {
+                self.poisoned = true;
+            }
+        }
+        written
     }
 }
 
@@ -104,13 +136,18 @@ struct Store {
     by_id: HashMap<String, Charge>,
     /// tok_limited で使った額
     spent: u64,
+    /// 承認した決済の数
+    succeeded: usize,
     journal: Option<Journal>,
 }
 
 impl Store {
     fn remember(&mut self, req: ChargeRequest, charge: Charge) {
-        if req.card_token == "tok_limited" && charge.status == Outcome::Succeeded {
-            self.spent = self.spent.saturating_add(charge.amount);
+        if charge.status == Outcome::Succeeded {
+            self.succeeded += 1;
+            if req.card_token == "tok_limited" {
+                self.spent = self.spent.saturating_add(charge.amount);
+            }
         }
         self.by_key.insert(req.idempotency_key.clone(), (req, charge.id.clone()));
         self.by_id.insert(charge.id.clone(), charge);
@@ -182,9 +219,6 @@ impl App {
                 Err((StatusCode::CONFLICT, "the idempotency_key was used for a different charge"))
             };
         }
-        if s.by_key.len() >= MAX_CHARGES {
-            return Err((StatusCode::SERVICE_UNAVAILABLE, "too many charges"));
-        }
         let decline = |reason: &str| (Outcome::Declined, Some(reason.to_owned()));
         let (status, reason) = match req.card_token.as_str() {
             "tok_visa" => (Outcome::Succeeded, None),
@@ -195,6 +229,9 @@ impl App {
             },
             _ => decline("unknown card"),
         };
+        if status == Outcome::Succeeded && s.succeeded >= MAX_CHARGES {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "too many charges"));
+        }
         let charge = Charge { id: new_id(), status, amount: req.amount, currency: req.currency.clone(), reason };
         // 記録できなければ決済しない（再起動の後に同じキーで二重に決済しないため）
         if let Some(j) = s.journal.as_mut()
@@ -210,12 +247,30 @@ impl App {
     pub fn find(&self, id: &str) -> Option<Charge> {
         self.store.lock().expect("store lock").by_id.get(id).cloned()
     }
+
+    /// 冪等キーで決済を探す。
+    pub fn find_by_key(&self, key: &str) -> Option<Charge> {
+        let s = self.store.lock().expect("store lock");
+        s.by_key.get(key).and_then(|(_, id)| s.by_id.get(id)).cloned()
+    }
+}
+
+#[derive(Deserialize)]
+struct ByKey {
+    idempotency_key: String,
 }
 
 async fn create(State(app): State<App>, Json(req): Json<ChargeRequest>) -> Response {
     match app.charge(req) {
         Ok(c) => (status_of(&c), Json(c)).into_response(),
         Err((status, message)) => error(status, message),
+    }
+}
+
+async fn lookup(State(app): State<App>, Query(q): Query<ByKey>) -> Response {
+    match app.find_by_key(&q.idempotency_key) {
+        Some(c) => Json(c).into_response(),
+        None => error(StatusCode::NOT_FOUND, "no such charge"),
     }
 }
 
@@ -229,7 +284,7 @@ async fn show(State(app): State<App>, Path(id): Path<String>) -> Response {
 pub fn router(app: App) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/charges", post(create))
+        .route("/charges", post(create).get(lookup))
         .route("/charges/{id}", get(show))
         .layer(axum::extract::DefaultBodyLimit::max(4 * 1024))
         .with_state(app)
@@ -320,6 +375,39 @@ mod tests {
         let b = app.charge(req("b", 10, "tok_visa")).unwrap().id;
         assert_ne!(a, b);
         assert_eq!(a.len(), 3 + 24);
+    }
+
+    #[tokio::test]
+    async fn charges_can_be_found_by_their_key() {
+        let app = App::default();
+        let c = app.charge(req("order-k", 10, "tok_visa")).unwrap();
+        let get = |uri: &str| Request::get(uri.to_owned()).body(Body::empty()).unwrap();
+        let r = router(app.clone()).oneshot(get("/charges?idempotency_key=order-k")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body: Charge = serde_json::from_slice(&r.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body, c);
+        let r = router(app).oneshot(get("/charges?idempotency_key=nothing")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn a_torn_last_line_is_dropped_and_the_journal_stays_usable() {
+        let path = std::env::temp_dir().join(format!("payment-journal-{}", new_id()));
+        let first = App::with_journal(&path).unwrap();
+        let kept = first.charge(req("k", 10, "tok_visa")).unwrap();
+        drop(first);
+        // 書いている途中で落ちた
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"{\"request\":{\"idempotency_key\":\"lost\"").unwrap();
+        drop(f);
+        let second = App::with_journal(&path).unwrap();
+        assert_eq!(second.find_by_key("k"), Some(kept));
+        assert_eq!(second.find_by_key("lost"), None);
+        second.charge(req("after", 10, "tok_visa")).unwrap();
+        drop(second);
+        let third = App::with_journal(&path).unwrap();
+        assert!(third.find_by_key("after").is_some());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
