@@ -2,9 +2,8 @@
 DEV      := ai-yagni-data-rust-dev
 VERUS    := ai-yagni-data-verus
 NAME     := ai-yagni-data-sdk-example-payment
-SOCK     := -v /var/run/docker.sock:/var/run/docker.sock
 CACHE    := -v ai-yagni-data-cargo:/usr/local/cargo/registry -v ai-yagni-data-cargo-git:/usr/local/cargo/git -v $(NAME)-target:/work/target
-RUN      := docker run --rm $(SOCK) $(CACHE) -v $(CURDIR):/work -w /work $(DEV)
+RUN      := docker run --rm $(CACHE) -v $(CURDIR):/work -w /work $(DEV)
 
 .DEFAULT_GOAL := help
 .PHONY: help image verus-image build test lint fmt verify ci sh run
@@ -37,7 +36,7 @@ verify: verus-image ## Verus で証明を確かめる（verified/）
 ci: lint test verify ## CI で走らせるもの全部
 
 sh: image ## 開発用のシェル
-	docker run --rm -it $(SOCK) $(CACHE) -v $(CURDIR):/work -w /work $(DEV) bash
+	docker run --rm -it $(CACHE) -v $(CURDIR):/work -w /work $(DEV) bash
 
 run: ## 手元で起動する（http://localhost:8081）
 	docker build -q -t ai-yagni-data-payment . >/dev/null
